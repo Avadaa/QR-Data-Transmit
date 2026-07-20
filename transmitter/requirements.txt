@@ -1,0 +1,21 @@
+# Python transmitter dependencies (transmit.py + config.py + glyphs.py + rs.py).
+# Everything else it uses (hashlib, io, math, os, sys, threading, time, zlib) is
+# the standard library. Python 3.9-3.12.
+#
+# Version floors are conservative for portability; known-good tested set:
+#   Python 3.10, numpy 2.2.6, opencv-python-headless 4.11.0.86, pygame 2.6.1, segno 1.6.6
+# (also installs on Python 3.9 with earlier 1.x numpy — the original mac rig).
+#
+# NOTE on OpenCV: HEADLESS and pinned <4.12.
+#  - The transmitter uses cv2 only for array/glyph rendering (cv2.line/resize in
+#    glyphs.py), never GUI windows -> headless (no Qt/GTK) is the right variant.
+#  - opencv-python >=4.12 (headless too) bundles its own libSDL2, which collides
+#    with pygame's SDL2 on macOS ("Class SDL... implemented in both ..." -> may
+#    cause mysterious crashes) — unacceptable for the transmitter, whose whole job
+#    is a rock-solid fullscreen pygame display. Verified on the mac rig: 4.11.0.86
+#    and earlier ship NO SDL2 (0 collisions); 4.13 and 5.0 both do. Pin <4.12.
+
+numpy>=1.23
+opencv-python-headless>=4.7,<4.12   # cv2 — glyph rendering; <4.12 avoids the SDL2/pygame clash, see note
+pygame>=2.1                         # fullscreen display + vsync pacing (transmit.py)
+segno>=1.5                          # QR control-plane codes (transmit.py)

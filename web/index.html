@@ -1,0 +1,632 @@
+<!doctype html>
+<!-- web transmitter — browser port of transmit.py (wire format v1.4, docs/decode_practical.md).
+     One page, no server, no network: open, set, run. Settings persist in localStorage.
+     Frame pacing rides requestAnimationFrame (vsync-locked by the browser compositor) and
+     auto-measures the panel refresh, so 60Hz and 120Hz/ProMotion both pace exactly.
+     Field is a 1:1 logical-pixel square (default 1024) on a black page: black background,
+     white ring, glyphs inside — minimum panel light. qrcode.js = qrcode-generator (MIT). -->
+<html><head><meta charset="utf-8"><title>QR optical transmitter</title>
+<style>
+  html, body { margin: 0; background: #000; color: #888; font: 13px/1.5 -apple-system, system-ui, monospace; height: 100%; overflow: hidden; }
+  #wrap { display: flex; height: 100%; }
+  #ui { width: 250px; padding: 12px; box-sizing: border-box; flex-shrink: 0; overflow-y: auto; }
+  #ui.dim { opacity: 0.15; }
+  #ui h1 { font-size: 14px; color: #bbb; margin: 0 0 10px; }
+  #ui label { display: flex; justify-content: space-between; align-items: center; margin: 4px 0; }
+  #ui input, #ui select { background: #111; color: #aaa; border: 1px solid #333; padding: 2px 4px; width: 90px; box-sizing: border-box; }
+  #ui input[type=checkbox] { width: auto; }
+  #ui button { display: block; width: 100%; margin: 6px 0; padding: 8px; background: #1a1a2a; color: #ccc; border: 1px solid #445; cursor: pointer; font: inherit; }
+  #info { margin-top: 10px; font-size: 11px; color: #666; white-space: pre-wrap; word-break: break-all; }
+  #main { flex: 1; display: flex; flex-direction: column; }
+  #topbar { display: flex; gap: 10px; justify-content: center; padding: 10px; }
+  #topbar.dim { opacity: 0.15; }
+  #topbar button { padding: 8px 18px; background: #1a1a2a; color: #ccc; border: 1px solid #445; cursor: pointer; font: inherit; }
+  #topbar button.active { background: #2a4a2a; color: #fff; border-color: #6a6; }
+  #topbar button.idle { background: #111; color: #777; }
+  #stage { flex: 1; display: flex; align-items: center; justify-content: center; cursor: none; }
+  #field { image-rendering: pixelated; background: #000; }
+  #stat { position: fixed; left: 260px; bottom: 4px; font-size: 11px; color: #555; }
+  hr { border: 0; border-top: 1px solid #222; margin: 10px 0; }
+</style></head>
+<body>
+<div id="wrap">
+  <div id="ui">
+    <h1>QR optical transmitter</h1>
+    <label>wire <select id="s_wire"><option value="2">v2 glyphs</option><option value="3" selected>v3 DMT</option></select></label>
+    <label>v3 amp <select id="s_v3a"><option>20</option><option>30</option><option selected>40</option></select></label>
+    <label>v3 levels <select id="s_v3lv"><option value="4">PAM-4</option><option value="2" selected>PAM-2</option></select></label>
+    <label>v3 NC <select id="s_v3nc"><option>6</option><option selected>8</option><option>12</option><option>20</option></select></label>
+    <label>tile px <select id="s_px"><option>8</option><option>12</option><option selected>16</option><option>20</option><option>24</option><option>30</option></select></label>
+    <label>field px <input id="s_field" type="number" value="1024" min="256" max="4096" step="2"></label>
+    <label>data fps <select id="s_fps"><option>1</option><option>2</option><option>3</option><option>4</option><option selected>5</option><option>6</option><option>10</option><option>12</option><option>15</option><option>20</option><option>30</option></select></label>
+    <label>train fps <select id="s_tfps"><option>2</option><option>3</option><option>5</option><option>10</option><option selected>15</option></select></label>
+    <label>nsym <select id="s_nsym"><option>16</option><option>32</option><option selected>64</option></select></label>
+    <label>repair % <input id="s_repair" type="number" value="6" min="0" max="50"></label>
+    <label>payload KB <input id="s_kb" type="number" value="100" min="1" max="8192"></label>
+    <label>file instead <input id="s_file" type="file" style="width:130px"></label>
+    <label>HiDPI 1:1 <input id="s_hidpi" type="checkbox"></label>
+    <hr>
+    <button id="btnFS">fullscreen</button>
+    <div id="info"></div>
+  </div>
+  <div id="main">
+    <div id="topbar">
+      <button id="st_idle" class="idle">idle</button>
+      <button id="st_trainqr">training qr</button>
+      <button id="st_training">start training</button>
+      <button id="st_startqr">arm qr</button>
+      <button id="st_data">start live</button>
+    </div>
+    <div id="stage"><canvas id="field"></canvas></div>
+  </div>
+</div>
+<div id="stat"></div>
+<script src="qrcode.js"></script>
+<script>
+"use strict";
+// ---- constants (wire format — must match config.py / the receivers) -----------------
+const RING = 8, GAP = 8;
+const TRAIN_SEED = 7000, REPAIR_SEED = 9000, PAYLOAD_SEED = 42, SCRAMBLE_SEED = 5000;
+const PALETTE = [[255,255,255],[0,255,0],[255,0,0],[255,255,0]];   // white green red yellow
+const SYNC = [[0,0],[1,1],[8,2],[9,3]];  // corner (shape,color): solid/white X/green ring/red dot/yellow
+
+// ---- PCG64: bit-exact numpy default_rng(int) chain (port of PCG64.swift, itself
+// validated against numpy). Training truth + repair masks + synth payload depend on it.
+function seedSeqState(entropy, n) {
+  const mul = (a, b) => Math.imul(a, b) >>> 0;
+  let hc = 0x43b0d7e5;
+  function hashmix(v) { v = (v ^ hc) >>> 0; hc = mul(hc, 0x931e8875); v = mul(v, hc); return (v ^ (v >>> 16)) >>> 0; }
+  function mix(x, y) { let r = (mul(x, 0xca01f9dd) - mul(y, 0x4973f715)) >>> 0; return (r ^ (r >>> 16)) >>> 0; }
+  const words = [entropy >>> 0];
+  if (entropy >= 4294967296) words.push(Math.floor(entropy / 4294967296) >>> 0);
+  const pool = [];
+  for (let i = 0; i < 4; i++) pool.push(hashmix(i < words.length ? words[i] : 0));
+  for (let s = 0; s < 4; s++) for (let d = 0; d < 4; d++) if (s !== d) pool[d] = mix(pool[d], hashmix(pool[s]));
+  hc = 0x8b51f9dd;
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    let v = (pool[i % 4] ^ hc) >>> 0; hc = mul(hc, 0x58f38ded); v = mul(v, hc);
+    out.push((v ^ (v >>> 16)) >>> 0);
+  }
+  return out;
+}
+const M64 = (1n << 64n) - 1n, M128 = (1n << 128n) - 1n;
+const PCG_MULT = (0x2360ed051fc65da4n << 64n) | 0x4385df649fccf645n;
+class PCG64 {
+  constructor(seed) {
+    const w = seedSeqState(seed, 8);
+    const u = [];
+    for (let i = 0; i < 4; i++) u.push(BigInt(w[2 * i]) | (BigInt(w[2 * i + 1]) << 32n));
+    this.inc = ((((u[2] << 64n) | u[3]) << 1n) | 1n) & M128;
+    this.state = 0n; this.buf = null;
+    this.step();
+    this.state = (this.state + ((u[0] << 64n) | u[1])) & M128;
+    this.step();
+  }
+  step() { this.state = (this.state * PCG_MULT + this.inc) & M128; }
+  next64() {                     // step FIRST, then xsl-rr
+    this.step();
+    const hi = this.state >> 64n, lo = this.state & M64;
+    const rot = hi >> 58n, x = hi ^ lo;
+    return rot === 0n ? x : ((x >> rot) | (x << (64n - rot))) & M64;
+  }
+  next32() {                     // buffered halves, LOW first
+    if (this.buf !== null) { const b = this.buf; this.buf = null; return b; }
+    const d = this.next64();
+    this.buf = Number(d >> 32n) >>> 0;
+    return Number(d & 0xFFFFFFFFn) >>> 0;
+  }
+  integers(hiEx, n) {            // Lemire for power-of-2 hi (exact in doubles: < 2^41)
+    const out = new Uint8Array(n);
+    for (let i = 0; i < n; i++) out[i] = Math.floor(this.next32() * hiEx / 4294967296);
+    return out;
+  }
+}
+
+// ---- crc32 (zlib) -------------------------------------------------------------------
+const CRCT = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
+  return t;
+})();
+function crc32(bytes) {
+  let c = 0xFFFFFFFF;
+  for (const b of bytes) c = CRCT[(c ^ b) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+// ---- RS(255, 255-nsym) systematic encode (port of rs.py) ----------------------------
+const EXP = new Int32Array(510), LOG = new Int32Array(256);
+{ let x = 1; for (let i = 0; i < 255; i++) { EXP[i] = x; LOG[x] = i; x <<= 1; if (x & 0x100) x ^= 0x11d; } for (let i = 255; i < 510; i++) EXP[i] = EXP[i - 255]; }
+const gfMul = (a, b) => (a && b) ? EXP[LOG[a] + LOG[b]] : 0;
+const GPOLY = {};
+function genPoly(nsym) {
+  if (GPOLY[nsym]) return GPOLY[nsym];
+  let g = [1];
+  for (let i = 0; i < nsym; i++) {
+    const g2 = new Array(g.length + 1).fill(0);
+    for (let j = 0; j < g.length; j++) { g2[j] ^= g[j]; g2[j + 1] ^= gfMul(g[j], EXP[i]); }
+    g = g2;
+  }
+  return GPOLY[nsym] = g.slice(1);
+}
+function rsEncode(data, nsym) {          // Uint8Array(k) -> Uint8Array(k+nsym)
+  const g = genPoly(nsym), par = new Uint8Array(nsym);
+  for (const d of data) {
+    const f = d ^ par[0];
+    par.copyWithin(0, 1); par[nsym - 1] = 0;
+    if (f) for (let j = 0; j < nsym; j++) par[j] ^= gfMul(f, g[j]);
+  }
+  const out = new Uint8Array(data.length + nsym);
+  out.set(data); out.set(par, data.length);
+  return out;
+}
+
+// ---- md5 (for the sent-payload printout) --------------------------------------------
+function md5hex(bytes) {
+  const S = [7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+             4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21];
+  const K = new Uint32Array(64);
+  for (let i = 0; i < 64; i++) K[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 4294967296);
+  const n = bytes.length, total = (((n + 8) >> 6) + 1) << 6;
+  const buf = new Uint8Array(total);
+  buf.set(bytes); buf[n] = 0x80;
+  const bits = n * 8;
+  new DataView(buf.buffer).setUint32(total - 8, bits >>> 0, true);
+  new DataView(buf.buffer).setUint32(total - 4, Math.floor(bits / 4294967296), true);
+  let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+  const M = new Uint32Array(16), dv = new DataView(buf.buffer);
+  const rl = (x, c) => (x << c) | (x >>> (32 - c));
+  for (let off = 0; off < total; off += 64) {
+    for (let i = 0; i < 16; i++) M[i] = dv.getUint32(off + i * 4, true);
+    let A = a0, B = b0, C = c0, D = d0;
+    for (let i = 0; i < 64; i++) {
+      let F, g;
+      if (i < 16) { F = (B & C) | (~B & D); g = i; }
+      else if (i < 32) { F = (D & B) | (~D & C); g = (5 * i + 1) % 16; }
+      else if (i < 48) { F = B ^ C ^ D; g = (3 * i + 5) % 16; }
+      else { F = C ^ (B | ~D); g = (7 * i) % 16; }
+      F = (F + A + K[i] + M[g]) >>> 0;
+      A = D; D = C; C = B;
+      B = (B + rl(F, S[i])) >>> 0;
+    }
+    a0 = (a0 + A) >>> 0; b0 = (b0 + B) >>> 0; c0 = (c0 + C) >>> 0; d0 = (d0 + D) >>> 0;
+  }
+  return [a0, b0, c0, d0].map(v =>
+    [v & 255, (v >>> 8) & 255, (v >>> 16) & 255, v >>> 24]
+      .map(b => b.toString(16).padStart(2, "0")).join("")).join("");
+}
+
+// ---- glyphs (port of glyphs.py, V2.1 alphabet) --------------------------------------
+// Blocky shapes: 4x4 pattern, nearest resize. Line shapes: binary capsule strokes at 4x
+// (cv2.line w=D//5, round caps), then exact 4x4 box-average down — the same
+// supersample+INTER_AREA anti-aliasing the models were trained on.
+const BLOCKY = {0:["####","####","####","####"], 5:["###.","##..","#...","...."],
+                6:[".###","..##","...#","...."], 7:["....","#...","##..","###."],
+                8:["####","#..#","#..#","####"], 9:["....",".##.",".##.","...."],
+                12:["##..","##..","..##","..##"], 13:["..##","..##","##..","##.."]};
+function shapeMask(i, S) {
+  const m = new Float32Array(S * S);
+  if (i in BLOCKY) {
+    const p = BLOCKY[i];
+    for (let y = 0; y < S; y++) for (let x = 0; x < S; x++)
+      m[y * S + x] = p[Math.floor(y * 4 / S)][Math.floor(x * 4 / S)] === "#" ? 1 : 0;
+    return m;
+  }
+  const D = S * 4;
+  let im = new Float32Array(D * D);
+  const w = Math.max(1, Math.floor(D / 5)), mg = Math.floor(w / 2) + 1, r = w / 2;
+  function line(x0, y0, x1, y1, v) {     // filled capsule = thick line, round caps
+    const dx = x1 - x0, dy = y1 - y0, L2 = dx * dx + dy * dy;
+    const yA = Math.max(0, Math.floor(Math.min(y0, y1) - r - 1));
+    const yB = Math.min(D - 1, Math.ceil(Math.max(y0, y1) + r + 1));
+    const xA = Math.max(0, Math.floor(Math.min(x0, x1) - r - 1));
+    const xB = Math.min(D - 1, Math.ceil(Math.max(x0, x1) + r + 1));
+    for (let y = yA; y <= yB; y++) for (let x = xA; x <= xB; x++) {
+      let t = L2 ? ((x - x0) * dx + (y - y0) * dy) / L2 : 0;
+      t = t < 0 ? 0 : t > 1 ? 1 : t;
+      const px = x0 + t * dx, py = y0 + t * dy;
+      if ((x - px) * (x - px) + (y - py) * (y - py) <= r * r) im[y * D + x] = v;
+    }
+  }
+  const rot90 = () => {                  // numpy rot90 (CCW): out[y][x] = im[x][D-1-y]
+    const o = new Float32Array(D * D);
+    for (let y = 0; y < D; y++) for (let x = 0; x < D; x++) o[y * D + x] = im[x * D + (D - 1 - y)];
+    im = o;
+  };
+  if (i === 1) { line(0, 0, D - 1, D - 1, 1); line(D - 1, 0, 0, D - 1, 1); }              // X
+  else if (i === 2) { line(D / 2, 0, D / 2, D - 1, 1); line(0, D / 2, D - 1, D / 2, 1); } // plus
+  else if (i === 3) { im.fill(1); line(0, D - 1, D - 1, 0, 0); }                          // cutSlash
+  else if (i === 4) { im.fill(1); line(0, 0, D - 1, D - 1, 0); }                          // cutBackslash
+  else if (i === 10 || i === 11) {                                                        // Z / N
+    line(mg, mg, D - mg, mg, 1); line(D - mg, mg, mg, D - mg, 1); line(mg, D - mg, D - mg, D - mg, 1);
+    if (i === 11) rot90();
+  } else if (i === 14 || i === 15) {                                                      // Y / Y90
+    line(mg, mg, D / 2, D / 2, 1); line(D - mg, mg, D / 2, D / 2, 1); line(D / 2, D / 2, D / 2, D - mg, 1);
+    if (i === 15) rot90();
+  }
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    let s = 0;
+    for (let yy = 0; yy < 4; yy++) for (let xx = 0; xx < 4; xx++) s += im[(y * 4 + yy) * D + (x * 4 + xx)];
+    m[y * S + x] = s / 16;
+  }
+  return m;
+}
+
+// ---- session state ------------------------------------------------------------------
+const $ = id => document.getElementById(id);
+const canvas = $("field"), ctx = canvas.getContext("2d");
+let cfg = {};                    // px, fieldPx, fps, tfps, nsym, repairPct, kb, hidpi
+let L = null;                    // layout: cols rows T corners hdr pay nblk kpf W0
+let sprites = null;              // 16x4 offscreen canvases at px
+let fileBytes = null, fileName = null;
+let session = null;              // { data, size, md5, FRAMES, REPAIR, TOT, code }
+let phase = "idle";              // idle trainqr training startqr data endqr
+let trainIdx = 0, dataIdx = -1, holdLeft = 0, sentT0 = 0;
+let deltas = [], lastTs = 0, lateTicks = 0;
+let wakeLock = null;
+
+function readCfg() {
+  cfg = { px: +$("s_px").value, fieldPx: +$("s_field").value, fps: +$("s_fps").value,
+          tfps: +$("s_tfps").value, nsym: +$("s_nsym").value, repairPct: +$("s_repair").value,
+          kb: +$("s_kb").value, hidpi: $("s_hidpi").checked, wire: +$("s_wire").value,
+          v3a: +$("s_v3a").value, v3lv: +$("s_v3lv").value, v3nc: +$("s_v3nc").value };
+  localStorage.setItem("qrtx", JSON.stringify(cfg));
+}
+function loadCfg() {
+  try {
+    const c = JSON.parse(localStorage.getItem("qrtx"));
+    if (!c) return;
+    $("s_px").value = c.px; $("s_field").value = c.fieldPx; $("s_fps").value = c.fps;
+    $("s_tfps").value = c.tfps; $("s_nsym").value = c.nsym; $("s_repair").value = c.repairPct;
+    $("s_kb").value = c.kb; $("s_hidpi").checked = !!c.hidpi;
+    $("s_wire").value = c.wire || 2;
+    $("s_v3a").value = c.v3a || 40; $("s_v3lv").value = c.v3lv || 2;
+    $("s_v3nc").value = c.v3nc || 8;
+  } catch (e) {}
+}
+
+function layout() {
+  const px = cfg.px;
+  const inner = cfg.fieldPx - 2 * (RING + GAP);
+  const cols = Math.floor(inner / px), rows = cols;      // 1:1 square field
+  const T = cols * rows;
+  const corners = [0, cols - 1, (rows - 1) * cols, T - 1];
+  const free = [];
+  for (let t = 0; t < T; t++) if (!corners.includes(t)) free.push(t);
+  const hdr = free.slice(0, 49), pay = free.slice(49);
+  const capBytes = cfg.wire === 3 ? Math.floor(pay.length * 3 * v3nc() * v3bits() / 8)
+                                  : Math.floor(pay.length * 6 / 8);
+  const nblk = Math.floor(capBytes / 255);
+  const kpf = nblk * (255 - cfg.nsym);
+  const W0 = cols * px + 2 * (RING + GAP);
+  L = { px, cols, rows, T, corners, hdr, pay, nblk, kpf, W0, CAP: pay.length * 6 };
+  if (cfg.wire === 3) L.v3pat = v3Patterns(px);
+  canvas.width = W0; canvas.height = W0;
+  const cssW = cfg.hidpi ? W0 / devicePixelRatio : W0;
+  canvas.style.width = cssW + "px"; canvas.style.height = cssW + "px";
+  sprites = [];
+  for (let s = 0; s < 16; s++) {
+    const mask = shapeMask(s, px), row = [];
+    for (let c = 0; c < 4; c++) {
+      const cv = document.createElement("canvas");
+      cv.width = px; cv.height = px;
+      const id = cv.getContext("2d").createImageData(px, px);
+      for (let p = 0; p < px * px; p++) {
+        id.data[4 * p] = Math.round(mask[p] * PALETTE[c][0]);
+        id.data[4 * p + 1] = Math.round(mask[p] * PALETTE[c][1]);
+        id.data[4 * p + 2] = Math.round(mask[p] * PALETTE[c][2]);
+        id.data[4 * p + 3] = 255;
+      }
+      cv.getContext("2d").putImageData(id, 0, 0);
+      row.push(cv);
+    }
+    sprites.push(row);
+  }
+}
+
+// ---- v3 DMT wire (EXPERIMENTAL — see test/v3/ for the PoC + numbers) ----------------
+// Payload cells carry NC DCT coefficients x 3 color channels, PAM-4 each: 120 raw
+// bits/cell vs the glyph's 6. Header + corners STAY v2 glyphs so the phone's naming
+// machinery identifies every frame; the phone has NO demapper yet — v3 sessions are
+// for filming/dataset collection. JS IDCT ~60-120 ms/frame: keep fps <= 5.
+// v3.1 experimental knobs (Settings): amplitude A, PAM-2 vs PAM-4, NC — the REAL-
+// footage study (test/pictrain/realv3/REPORT.md) killed PAM-4@A20 and pointed here
+const v3nc = () => cfg.v3nc || 8, v3a = () => cfg.v3a || 40;
+const v3lvl = () => cfg.v3lv === 4 ? [-3, -1, 1, 3] : [-3, 3];
+const v3bits = () => cfg.v3lv === 4 ? 2 : 1;
+function v3Patterns(px) {
+  const zz = [];
+  for (let u = 0; u < px; u++) for (let v = 0; v < px; v++) if (u + v > 0) zz.push([u, v]);
+  zz.sort((a, b) => (a[0] + a[1]) - (b[0] + b[1]) || Math.max(a[0], a[1]) - Math.max(b[0], b[1]));
+  const base = k => i =>
+    Math.sqrt((k === 0 ? 1 : 2) / px) * Math.cos(Math.PI * (2 * i + 1) * k / (2 * px));
+  return zz.slice(0, v3nc()).map(([u, v]) => {
+    const bu = base(u), bv = base(v), p = new Float32Array(px * px);
+    for (let y = 0; y < px; y++) for (let x = 0; x < px; x++)
+      p[y * px + x] = v3a() * bu(y) * bv(x);
+    return p;
+  });
+}
+function v3TrainPays(i) {              // seeded truth — the receiver-side demapper's
+  return new PCG64(TRAIN_SEED + i).integers(v3lvl().length,   // free labels
+                                            L.pay.length * 3 * v3nc());
+}
+function v3FramePays(i) {              // RS-coded wire bytes -> PAM symbols
+  const need = L.pay.length * 3 * v3nc(), nb = v3bits(), msk = (1 << nb) - 1;
+  const pays = new Uint8Array(need);
+  const nblk = L.nblk, base = i * nblk * 255;
+  let buf = 0, bits = 0, k = 0;
+  for (let w = 0; w < 255 && k < need; w++)
+    for (let b = 0; b < nblk && k < need; b++) {
+      buf = (buf << 8) | session.code[base + b * 255 + w];
+      bits += 8;
+      while (bits >= nb && k < need) { pays[k++] = (buf >>> (bits - nb)) & msk; bits -= nb; }
+    }
+  return pays;                         // tail cells stay level 0 — fixed, harmless
+}
+function drawV3(hdrSym, pays) {
+  const { px, cols, rows, W0 } = L, o = RING + GAP, n1 = px * px;
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, W0, W0);
+  ctx.fillStyle = "#000"; ctx.fillRect(RING, RING, W0 - 2 * RING, W0 - 2 * RING);
+  const gw = cols * px, gh = rows * px;
+  if (!L.v3img || L.v3img.width !== gw || L.v3img.height !== gh) L.v3img = new ImageData(gw, gh);
+  const d = L.v3img.data;
+  const acc = new Float32Array(n1);
+  const NCv = v3nc(), LVL = v3lvl();
+  for (let k = 0; k < L.pay.length; k++) {
+    const t = L.pay[k], r = Math.floor(t / cols), c = t % cols;
+    for (let ch = 0; ch < 3; ch++) {
+      acc.fill(128);
+      const b = (k * 3 + ch) * NCv;
+      for (let j = 0; j < NCv; j++) {
+        const lv = LVL[pays[b + j]], p = L.v3pat[j];
+        for (let i = 0; i < n1; i++) acc[i] += lv * p[i];
+      }
+      for (let y = 0; y < px; y++) {
+        const row = ((r * px + y) * gw + c * px) * 4;
+        for (let x = 0; x < px; x++) d[row + x * 4 + ch] = acc[y * px + x];
+      }
+    }
+  }
+  for (let i = 3; i < d.length; i += 4) d[i] = 255;
+  ctx.putImageData(L.v3img, o, o);
+  for (const t of [...L.hdr, ...L.corners]) {    // glyph header/corners painted OVER
+    const s = hdrSym[t];
+    ctx.drawImage(sprites[s >> 2][s & 3], o + (t % cols) * px, o + Math.floor(t / cols) * px);
+  }
+}
+const drawTrain = i => cfg.wire === 3 ? drawV3(baseSym(i), v3TrainPays(i))
+                                      : drawSym(trainSym(i));
+const drawFrame = i => cfg.wire === 3 ? drawV3(baseSym(i), v3FramePays(i))
+                                      : drawSym(frameSym(i));
+
+// ---- symbols ------------------------------------------------------------------------
+function baseSym(i) {
+  const sym = new Uint8Array(L.T);
+  const be = [(i >>> 24) & 255, (i >>> 16) & 255, (i >>> 8) & 255, i & 255];
+  const crc = crc32(be) & 0xFFF;
+  const bits = [];                       // 30 idx bits + 12 crc bits, MSB first
+  for (let j = 29; j >= 0; j--) bits.push((i >>> j) & 1);
+  for (let j = 11; j >= 0; j--) bits.push((crc >>> j) & 1);
+  for (let k = 0; k < 49; k++) {
+    let v = 0;
+    for (let b = 0; b < 6; b++) v = (v << 1) | bits[(k * 6 + b) % 42];
+    sym[L.hdr[k]] = v;
+  }
+  for (let k = 0; k < 4; k++) sym[L.corners[k]] = (SYNC[k][0] << 2) | SYNC[k][1];
+  return sym;
+}
+function trainSym(i) {
+  const sym = baseSym(i);
+  const pay = new PCG64(TRAIN_SEED + i).integers(64, L.pay.length);
+  for (let k = 0; k < L.pay.length; k++) sym[L.pay[k]] = pay[k];
+  return sym;
+}
+function frameSym(i) {                   // data frame from session.code
+  const sym = baseSym(i);
+  const nblk = L.nblk, base = i * nblk * 255;
+  let bitBuf = 0, bitN = 0, k = 0;       // stream bytes interleaved: w-major, block-minor
+  for (let w = 0; w < 255 && k < L.pay.length; w++) {
+    for (let b = 0; b < nblk && k < L.pay.length; b++) {
+      bitBuf = (bitBuf << 8) | session.code[base + b * 255 + w];
+      bitN += 8;
+      while (bitN >= 6 && k < L.pay.length) {
+        sym[L.pay[k++]] = (bitBuf >>> (bitN - 6)) & 63;
+        bitN -= 6;
+      }
+    }
+  }
+  if (k < L.pay.length && bitN > 0) sym[L.pay[k++]] = (bitBuf << (6 - bitN)) & 63;
+  return sym;                            // remaining pay tiles stay 0 (zero-pad)
+}
+
+// ---- rendering ----------------------------------------------------------------------
+function drawSym(sym) {
+  const { px, cols, rows, W0 } = L, o = RING + GAP;
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, W0, W0);
+  ctx.fillStyle = "#000"; ctx.fillRect(RING, RING, W0 - 2 * RING, W0 - 2 * RING);
+  for (let t = 0; t < L.T; t++) {
+    const s = sym[t];
+    ctx.drawImage(sprites[s >> 2][s & 3], o + (t % cols) * px, o + Math.floor(t / cols) * px);
+  }
+}
+function drawQR(text) {
+  drawTrain(0);                          // control QRs ride ON the idle field (AE state)
+  const qr = qrcode(0, "M");
+  qr.addData(text); qr.make();
+  const n = qr.getModuleCount(), sc = 10, border = 4;
+  const size = (n + 2 * border) * sc;
+  const x0 = Math.floor((L.W0 - size) / 2), y0 = x0;
+  ctx.fillStyle = "#fff"; ctx.fillRect(x0, y0, size, size);
+  ctx.fillStyle = "#000";
+  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++)
+    if (qr.isDark(r, c)) ctx.fillRect(x0 + (border + c) * sc, y0 + (border + r) * sc, sc, sc);
+}
+
+// ---- payload / coding ---------------------------------------------------------------
+function buildSession() {
+  const data = fileBytes ? new Uint8Array(fileBytes)
+    : new PCG64(PAYLOAD_SEED).integers(256, cfg.kb * 1024);
+  const kpf = L.kpf, nsym = cfg.nsym, K = 255 - nsym;
+  const FRAMES = Math.ceil(data.length / kpf);
+  const rows_ = new Uint8Array(FRAMES * kpf);
+  rows_.set(data);
+  // WHITENING (SCR=1): structured content (a PDF's xref = runs of 0x30) renders as
+  // 50-86% WHITE fields that bloom the camera — measured killing the last frames of
+  // a real transfer. XOR each source row with a seeded keystream: any content becomes
+  // a uniform random field. Repairs XOR scrambled rows; receiver unscrambles at
+  // assembly, so RS and the fountain never notice.
+  for (let i = 0; i < FRAMES; i++) {
+    const ks = new PCG64(SCRAMBLE_SEED + i).integers(256, kpf);
+    for (let b = 0; b < kpf; b++) rows_[i * kpf + b] ^= ks[b];
+  }
+  const REPAIR = cfg.repairPct > 0 ? Math.max(8, Math.ceil(FRAMES * cfg.repairPct / 100)) : 0;
+  const TOT = FRAMES + REPAIR;
+  const all = new Uint8Array(TOT * kpf);
+  all.set(rows_);
+  for (let j = 0; j < REPAIR; j++) {
+    const m = new PCG64(REPAIR_SEED + j).integers(2, FRAMES);
+    if (!m.some(v => v)) m[j % FRAMES] = 1;
+    const off = (FRAMES + j) * kpf;
+    for (let i = 0; i < FRAMES; i++) if (m[i])
+      for (let b = 0; b < kpf; b++) all[off + b] ^= all[i * kpf + b];
+  }
+  const code = new Uint8Array(TOT * L.nblk * 255);
+  for (let i = 0; i < TOT; i++)
+    for (let b = 0; b < L.nblk; b++)
+      code.set(rsEncode(all.subarray(i * kpf + b * K, i * kpf + (b + 1) * K), nsym),
+               (i * L.nblk + b) * 255);
+  session = { data, size: data.length, md5: md5hex(data), FRAMES, REPAIR, TOT, code };
+}
+const wireTag = () => cfg.wire === 3
+  ? `,V=3,NC=${v3nc()},A=${v3a()},LV=${v3lvl().length}` : "";
+const trainText = () => `---TRAIN---,PX=${L.px},FPS=${cfg.tfps},COLS=${L.cols},ROWS=${L.rows},NSYM=${cfg.nsym}` + wireTag();
+function safeName() {          // filename into the arm QR: strip anything that could
+  if (!fileName) return null;  // break the k=v wire or a filesystem, keep the extension
+  const dot = fileName.lastIndexOf(".");
+  const ext = dot > 0 ? fileName.slice(dot + 1).replace(/[^A-Za-z0-9]/g, "") : "";
+  let base = (dot > 0 ? fileName.slice(0, dot) : fileName).replace(/[^A-Za-z0-9._-]/g, "_");
+  if (base.length > 40) base = base.slice(0, 40);
+  return ext ? `${base}.${ext}` : base;
+}
+const startText = () => `---START---,FRAMES=${session.FRAMES},REPAIR=${session.REPAIR},SIZE=${session.size},`
+                      + `PX=${L.px},FPS=${cfg.fps},COLS=${L.cols},ROWS=${L.rows},NSYM=${cfg.nsym},SCR=1` + wireTag()
+                      + (safeName() ? `,NAME=${safeName()}` : "");
+const endText = () => `---END---,FRAMES=${session.FRAMES}`;
+
+// ---- phase machine + vsync pacing ---------------------------------------------------
+function measuredHz() {
+  if (deltas.length < 30) return 60;
+  const s = [...deltas].sort((a, b) => a - b);
+  const med = s[Math.floor(s.length / 2)];
+  return Math.max(1, Math.round(1000 / med));
+}
+function holdTicks(fps) { return Math.max(1, Math.round(measuredHz() / fps)); }
+
+function setPhase(p) {
+  phase = p;
+  const busy = p === "training" || p === "data";
+  $("ui").classList.toggle("dim", busy);
+  $("topbar").classList.toggle("dim", busy);
+  if (p === "idle") { drawTrain(0); }
+  if (p === "trainqr") { drawQR(trainText()); }
+  if (p === "training") { trainIdx = 0; holdLeft = 0; }
+  if (p === "startqr") { if (!session) buildSession(); drawQR(startText()); }
+  if (p === "data") {
+    if (!session) buildSession();
+    dataIdx = 0; lateTicks = 0; sentT0 = performance.now();
+    drawFrame(0);                         // frame 0 shows NOW; schedule owns the rest
+  }
+  if (p === "endqr") { drawQR(endText()); }
+  updateUI();
+}
+function tick(ts) {
+  requestAnimationFrame(tick);
+  if (lastTs) {
+    const d = ts - lastTs;
+    deltas.push(d); if (deltas.length > 240) deltas.shift();
+    if (phase === "data" && deltas.length > 30 && d > 1.6 * (1000 / measuredHz())) lateTicks++;
+  }
+  lastTs = ts;
+  if (phase === "training") {
+    if (--holdLeft <= 0) { drawTrain(trainIdx++); holdLeft = holdTicks(cfg.tfps); }
+  } else if (phase === "data") {
+    // TIMESTAMP-scheduled, not tick-counted: a stretched rAF tick (compositor hiccup,
+    // ProMotion adaptivity) COMPRESSES the next dwell instead of pushing the whole
+    // run — tick counting ran a 1877-frame transfer ~17% long and the receiver's
+    // nominal-schedule timeout hung up on a live transmission. Frame 0 dwells 4x;
+    // catch-up advances at most ONE frame per tick (every frame is always shown).
+    const e = (ts - sentT0) / 1000;
+    const target = Math.floor(e * cfg.fps) - 3;      // -3 = frame 0's extra dwells
+    if (target >= session.TOT) {
+      console.log(`sent ${session.TOT} frames in ${e.toFixed(1)}s`);
+      setPhase("endqr");
+    } else if (target > dataIdx) {
+      dataIdx++;
+      drawFrame(dataIdx);
+    }
+  }
+  if (!(ts & 0)) statLine(ts);
+}
+let lastStat = 0;
+function statLine(ts) {
+  if (ts - lastStat < 250) return;
+  lastStat = ts;
+  const hz = measuredHz();
+  let s = `[${phase}]  panel ${hz} Hz` + (Math.abs(hz - 60) > 3 && Math.abs(hz - 120) > 5 ? " (UNSTABLE?)" : "");
+  if (phase === "training") s += `  train frame ${trainIdx}`;
+  if (phase === "data") {
+    const drift = Math.floor((ts - sentT0) / 1000 * cfg.fps) - 3 - dataIdx;
+    s += `  frame ${dataIdx + 1}/${session.TOT}  late ${lateTicks}  drift ${drift}`;
+  }
+  $("stat").textContent = s;
+}
+
+// ---- UI: one button per stage, top bar; active stage highlighted --------------------
+const STAGES = [["st_idle", "idle"], ["st_trainqr", "trainqr"], ["st_training", "training"],
+                ["st_startqr", "startqr"], ["st_data", "data"]];
+function updateUI() {
+  for (const [id, p] of STAGES)
+    $(id).classList.toggle("active", phase === p || (p === "data" && phase === "endqr"));
+  const kbs = (L.kpf * cfg.fps / 1024).toFixed(2);
+  let info = `grid ${L.cols}x${L.rows} r${L.px}  T=${L.T}\n${L.nblk} RS blocks = ${L.kpf} B/frame`
+           + `\n${kbs} KB/s goodput (${Math.round(cfg.nsym / 255 * 100)}% RS)`
+           + `\nfield ${L.W0}px` + (cfg.hidpi ? " (device px)" : " (logical px)")
+           + (cfg.wire === 3 ? `\nv3 DMT: ${3 * v3nc() * v3bits()} raw bits/cell `
+              + `(A=${v3a()}, PAM-${v3lvl().length}) — EXPERIMENTAL`
+              + "\n(no phone demapper yet; footage mode; fps <= 5)" : "");
+  if (fileName) info += `\nfile: ${fileName} (${fileBytes.byteLength} B)`;
+  if (session) info += `\n${session.FRAMES}+${session.REPAIR} repair frames`
+                     + `\nSIZE ${session.size}\nmd5 ${session.md5}`;
+  $("info").textContent = info;
+}
+function rebuild() { readCfg(); session = null; layout(); setPhase("idle"); }
+for (const id of ["s_wire", "s_px", "s_field", "s_fps", "s_tfps", "s_nsym", "s_repair",
+                  "s_kb", "s_v3a", "s_v3lv", "s_v3nc"])
+  $(id).addEventListener("change", rebuild);
+$("s_hidpi").addEventListener("change", rebuild);
+$("s_file").addEventListener("change", async e => {
+  const f = e.target.files[0];
+  if (f) { fileBytes = await f.arrayBuffer(); fileName = f.name; } else { fileBytes = null; fileName = null; }
+  session = null; rebuild();
+});
+for (const [id, p] of STAGES) $(id).onclick = () => setPhase(p);
+$("btnFS").onclick = () => document.getElementById("stage").requestFullscreen();
+const ORDER = ["idle", "trainqr", "training", "startqr", "data"];
+document.addEventListener("keydown", e => {
+  if (e.key === "Enter") {                 // Enter walks the stages left to right
+    const i = ORDER.indexOf(phase === "endqr" ? "data" : phase);
+    if (i >= 0 && i < ORDER.length - 1) setPhase(ORDER[i + 1]);
+  }
+  if (e.key === "Escape" && phase !== "idle") setPhase("idle");
+});
+async function keepAwake() {
+  try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) keepAwake(); });
+
+loadCfg(); readCfg(); layout(); setPhase("idle"); keepAwake();
+requestAnimationFrame(tick);
+</script>
+</body></html>

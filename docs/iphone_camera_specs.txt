@@ -1,0 +1,177 @@
+Searched. Here's what's actually verifiable, mapped onto your six questions — plus where the sources run out and you'll have to dump it from the device.
+The hardware you're pointing at it
+The 14 Pro main camera is a 48MP 1/1.28" quad-Bayer sensor, 1.22 µm native pixels binning to 2.44 µm, behind a 24mm f/1.78 seven-element lens with second-gen sensor-shift OIS. TechInsights confirms the pitch: 1.22 µm at 48MP, 2.44 µm at 12MP. Two consequences for you: at 1080p you're reading a binned 12MP field with genuinely large effective pixels (ISO headroom is better than the numbers suggest), and sensor-shift OIS is a physically moving sensor — it will slowly re-register your homography if left on. TechInsightsApple Support
+1. Exposure floor and ISO
+There is no published per-device table. minExposureDuration is a property of AVCaptureDevice.Format, and it varies per format — the only honest answer is to loop device.formats and print it. The format description string carries it directly; on older iPhones these read like SS:0.000013-0.333333 (~13 µs to 1/3 s), and modern devices are in the same neighborhood. 5 ms is nowhere near the floor. You have room to go to 2 ms if you want.
+ISO: 25 ms → 5 ms is 2.32 stops, so ISO ~90 → ~450. On 2.44 µm binned pixels that's clean. Split the difference — bump panel brightness one notch (you have margin below the blooming point) and land at ISO 250–350.
+The counterintuitive one, and it's the highest-value finding in this search. You are almost certainly being wrecked by local tone mapping. Apple DTS, on exactly your complaint (manual exposure, iOS still re-equalizing pixel values): global tone mapping is off by default, and instead local tone mapping is used to constantly adjust the tone curves to adapt to changing scene dynamics; for the most stable manual control you want to turn global tone mapping on, and then use the manual exposure API. So isGlobalToneMappingEnabled = true (after checking activeFormat.isGlobalToneMappingSupported) — the opposite of what "disable the processing" instinct says. A per-frame adaptive tone curve is a per-frame nonstationarity your CNN has to eat; killing it should drop your error floor independent of fps. MacRumors
+No source found on mini-LED backlight PWM setting a lower bound on safe exposure. The XDR panel local-dims rather than PWM-dims, and your CAL sweep will measure this better than any doc.
+2. Capture rate/format — and the argument for 60
+Your .hd1920x1080 preset is doing something you don't want. From the AVFoundation headers: by default AVCaptureDevice always turns videoHDR off when a client uses setActiveFormat:; when the client uses setSessionPreset: instead, AVCaptureDevice turns videoHDR on automatically if it's a good fit for the preset. You're on a preset. You likely have video HDR silently enabled right now. Switch to explicit activeFormat selection and it turns off for free. objc.io
+On 60 vs 30, the math is better than "more shots per dwell." With periodic capture at interval Δ and a clean window W per dwell, a clean shot is guaranteed whenever W ≥ Δ — no probability, no phase luck:
+Display FdwellexpW = dwell − exp − readout(~10ms)30fps (Δ=33.3)60fps (Δ=16.7)10100 ms5 ms85 msguaranteedguaranteed1566.7 ms5 ms51.7 msguaranteedguaranteed2050 ms5 ms35 msbarely (35 > 33.3)guaranteed, 2× margin2050 ms25 ms15 msfailsfails
+So the killer at F=20 is the 25 ms exposure, not the 30 fps. Drop to 5 ms and even 30 fps technically closes — but with 1.5 ms of margin and a locked 3:2 phase relationship, it's a coin flip you flip once per session. Go to 60. 1080p60 with the least processing beats 4K60: your tile is ~13–14 camera px at 1080p, which is already comfortably above the ~8 px where per-tile classification starts to suffer, and 4K triples your CPU load for sharpness you don't need.
+3. Rolling shutter
+No published readout figure for the 14 Pro sensor exists. The general frame: readout speed in shutter notation is 1000/milliseconds, and the stagger between adjacent row resets equals the row read time, so the first row is read one full readout period earlier than the last. Conventional CMOS runs 15–25 ms; stacked CMOS is often under 10 ms — the 14 Pro main is a stacked design, so ~5–10 ms binned at 1080p is the right prior. Treat my 10 ms above as pessimistic. Wolfcrowuspto
+Your diagonal stripes are exactly the documented signature. The canonical demonstration is filming a 60 Hz display, where each image is shown for ~16 ms, with a rolling-shutter camera — readout crossing a panel refresh. And you can measure your own readout instead of guessing: the standard method counts banding from a known-frequency source and back-computes. Your transmitter is a programmable known-frequency source. Flash the whole field black/white at a fixed rate, count bands, done. ResearchGateWolfcrow
+Note the skew only costs you across the rows the field covers — if you shrink the field vertically you shrink the readout term in W.
+4. Processing pipeline
+Set, on the device: automaticallyAdjustsVideoHDREnabled = false (a Boolean indicating whether the device automatically manages HDR video streaming state), then isVideoHDREnabled = false if supported; automaticallyEnablesLowLightBoostWhenAvailable = false; isGlobalToneMappingEnabled = **true** (see above). On the connection: preferredVideoStabilizationMode = .off — stabilization is a connection-level property, gated on device.activeFormat.isVideoStabilizationModeSupported. Cinematic/standard EIS warps frames spatially; on a static rig it's pure poison for a cached homography. appleApple Developer
+Deep Fusion, Night mode, and Photonic Engine are AVCapturePhotoOutput fusion paths — they don't touch AVCaptureVideoDataOutput BGRA. Corroborating: the header notes that enabling global tone mapping disables all forms of still image fusion in a connected AVCapturePhotoOutput, which is a photo-output concern by construction. You can stop worrying about that family. Also disable sensor-shift OIS if the format lets you, and geometricDistortionCorrectionEnabled = false. objc.io
+5. Display side — and a bug in your current 8 fps run
+On 14- and 16-inch MacBook Pro models with Apple silicon, ProMotion is an adaptive refresh rate up to 120 Hz; the fixed alternatives in Displays settings are 60, 59.94, 50, 48, and 47.95 Hz, and Apple's own guidance is to choose a refresh rate that divides evenly into the frame rate of your content. A fixed 60 Hz display refreshes every 16 ms in a consistent cadence and supports smooth presentation of content whose frame rates are factors of 60. Apple SupportAppleMagazine
+And ProMotion actively misbehaves for fixed-rate renderers — a developer report of a 60 Hz-rendering app: smooth on an older MacBook Pro, jittery on an M1 with ProMotion enabled; selecting 60 Hz fixes it. Pin the panel to 60 Hz in System Settings → Displays. Not optional.
+Then the divisor rule bites you today: F=8 does not divide 60. 60/8 = 7.5, so your dwells are alternating 7 and 8 refreshes — 116.7 ms and 133.3 ms — and your 125 ms "dwell" is a fiction that exists only on average. That jitter is a freeClaude’s response was interrupted.did we cut off mid outputYes — cut off mid-sentence at the end of point 5. Picking up from there:
+...F=8 doesn't divide 60. 60/8 = 7.5, so your dwells alternate 7 and 8 refreshes — 116.7 ms and 133.3 ms. Your nominal 125 ms dwell exists only on average. That jitter is free error you're paying for right now at your record run, and it costs nothing to remove: use only F ∈ {10, 12, 15, 20, 30} at 60 Hz. Every one of those is an exact integer divisor, so every dwell is identical.
+Also set pygame.display.set_mode(..., vsync=1) and drive off flip-blocking rather than clock.tick(FPS). clock.tick is a sleep-based rate limiter with no relationship to the panel scan — it will drift against vsync and produce occasional double/dropped presentations that look exactly like the blends you're trying to eliminate. With vsync you'd present every Nth refresh (N=6 for F=10, N=4 for F=15, N=3 for F=20) and the cadence is exact by construction.
+6. Recommended combinations
+All rows assume: 60 Hz pinned panel, vsync'd presentation, 1080p60 capture via explicit activeFormat, HDR/EIS/low-light-boost off, GTM on, focus locked, exposure locked custom. Readout assumed ~10 ms (measure it; likely better).
+Fdwellrefreshes/dwellexposureISOWshots/dwellclean shots/dwell10100 ms68 ms~28082 ms64–5 guaranteed1566.7 ms45 ms~45051.7 ms43 guaranteed2050 ms35 ms~45035 ms32 guaranteed2050 ms33 ms~75037 ms32, wider margin
+At F=20 with 5 ms you keep 2 guaranteed clean shots per dwell and 2× margin on the guarantee — that's a real link, not a marginal one. Goodput at F=20 with your current KPF is 2.5× your record.
+Two caveats on that table. The phase is locked, not random, once F divides the refresh and capture is 60 fps — so the guarantee (W ≥ Δ) is the right criterion and the "82% clean" fraction reasoning stops applying. And FA best-shot picking gets easier, not harder: with 2–3 clean shots per dwell and identity from the header, you're choosing among knowns rather than hoping.
+What to change first, in order
+
+Pin the panel to 60 Hz. Free, one setting.
+F=10 instead of 8. Free, and removes a jitter source you didn't know you had. Re-run and compare err — this alone may move it.
+isGlobalToneMappingEnabled = true. The one non-obvious API finding; kills per-frame adaptive tone curves.
+Explicit activeFormat instead of .hd1920x1080 preset — turns videoHDR off for free, and gets you 60 fps.
+Dump device.formats and print minExposureDuration/minISO/maxISO per format. Every number in question 1 becomes a fact instead of a prior.
+Measure your readout by flashing the field at a known rate and counting bands. Then the W table above is exact.
+
+Steps 1–2 are display-side and testable in the next five minutes. 3–4 are a handful of lines in the receiver's session setup. Everything here is measurable through your CAL sweep in decoded-glyphs-vs-truth, which is the right way to settle any of it that I've gotten wrong.
+
+
+##########Claude Code##########
+
+We implemented all of the above on the live iPhone receiver and then bisected the eight
+proposed changes ONE AT A TIME on the real mac->iPhone rig, each measured against the
+factory loop_L16_best model (reloaded before each run to remove tuning-state confounds).
+Below: the results table, what it means, exactly which file/lines each change lives in,
+and — the part the research above left implicit — precisely what has to be tuned for
+each change to actually take effect (preconditions, coupling, which object owns it).
+
+## Results (mac rig, r16 92x57, factory model each run; "err" = live joint tile err)
+
+| # | change                          | verdict            | notes                                   |
+|---|---------------------------------|--------------------|-----------------------------------------|
+| 1 | explicit 1080p60 activeFormat   | KEEP               | the win. also implicitly kills videoHDR |
+| 2 | 60 fps capture                  | KEEP               | 2x shots/dwell; needs #1                 |
+| 3 | videoHDR pinned off             | reject (slower)    | 0.2-0.5%, slower to converge            |
+| 4 | global tone mapping ON          | reject             | ~0.5% — the research's top pick LOST here|
+| 5 | low-light boost off             | reject             | ~0.7% (should be a no-op on a lit screen)|
+| 6 | geometric distortion corr off   | neutral            | 0.2-0.4%, but its transfer dropped 15   |
+| 7 | video stabilization (EIS) off   | reject             | failed, 23 drops — but MODEL CONFOUNDED  |
+| 8 | short <=8ms shutter, ISO up     | err OK, xfer FAILS | 0.2-0.4% err; dropped 8-13, failed      |
+
+## What the table means
+- The ONLY unambiguous win is #1+#2: explicit 1080p60 format + 60 fps capture. That set
+  the throughput record and reaches 0.2-0.3% err fast even on a warm phone.
+- Every "turn OFF the ISP processing" instinct (#3/#4/#5/#7) was NEUTRAL-TO-HARMFUL on
+  this rig. The counterintuitive lesson: the iPhone's DEFAULT video processing (HDR,
+  local tone mapping, EIS) is HELPING the channel, not hurting it. #4 (global tone
+  mapping) — the research's highest-value pick — measurably lost; the model was trained
+  against the local-tone-curve distribution and prefers it. #7 (EIS off) was the worst,
+  consistent with a propped phone: stabilization removes more handshake/desk-vibration
+  smear than its warp costs a static-rig homography. (Caveat: the #7 run may not have
+  used the factory model, so its verdict is soft — but the direction matches theory.)
+- CONFOUND #1, thermal: sensor noise rises with temperature; late-session runs were on a
+  hotter phone. We controlled for it by re-measuring #1+#2 warm (still 0.2-0.3%), so the
+  rejections are mostly real, but treat any single ~0.1-0.2% delta as within noise.
+- CONFOUND #2, model state: a tuned/forked model contaminates the comparison. Always tap
+  the app's "Factory" button before a bisection run.
+- THE REAL BLOCKER IS NOT A CAMERA SETTING. Every high-fps transfer dropped ~8-15 frames
+  regardless of config (#6:15, #8:8-13, #7:23) and FAILED because drops exceeded the
+  fountain repair budget (10, = 3% of 314 frames). The drops come from the decode WORKER
+  falling behind at high fps: frames arrive faster than the CPU net (~50ms/frame) +
+  geometry can clear them, the backlog hits its cap (30), enqueue drops the overflow.
+  Error rate was never the problem; worker throughput is. Fixes, in order: (a) wire the
+  ANE/Metal decode path into the live loop (benched 8.3ms/frame = ~6x headroom, already
+  built, not yet connected) — the real fix; (b) raise transmit REPAIR to ~6% so repair
+  frames outnumber drops; (c) lower display fps until the worker keeps up (the byte-
+  perfect 31 KB/s runs were at a rate the CPU could drain).
+- PRODUCTION CONFIG: #1+#2 (reliable, byte-perfect). #8 is carried in the current build
+  as the anti-blend enabler for the FUTURE fps push, but it does not help until the
+  drops are fixed and only pays off at display fps > ~20.
+
+## Where the settings live
+File: shapes_n_colors -> the iOS app, `Camera.swift`
+  (on the mac: /Users/dev/Desktop/iOS Dev/QR File Transmit/Sources/Camera.swift)
+Two methods:
+  - `start()`             — session/format/HDR/GTM/lowlight/distortion/EIS (once)
+  - `settleAndLock()`     — focus/exposure/WB lock, incl. the #8 short shutter
+Almost every device property change must be wrapped in
+`device.lockForConfiguration()` ... `device.unlockForConfiguration()`.
+
+## What must be tuned for each change to take effect (the non-obvious preconditions)
+
+#1  Explicit format. sessionPreset MUST be `.inputPriority` (NOT a resolution preset like
+    .hd1920x1080). Then pick a format from `device.formats` and assign `device.activeFormat`
+    inside a lockForConfiguration block. SIDE EFFECT (free): using activeFormat instead of
+    a preset makes AVCaptureDevice turn videoHDR OFF automatically — presets turn it ON.
+    Selection filter we use: 1920x1080, a frame-rate range reaching >=60, prefer isVideoBinned
+    (big binned pixels = more ISO headroom, less processing).
+
+#2  60 fps. Set BOTH `activeVideoMinFrameDuration` and `activeVideoMaxFrameDuration` to
+    CMTime(value:1, timescale:60), in a lock block. REQUIRES #1: the default preset's
+    format tops out at 30 fps, so the format must be chosen first (a 60-capable one).
+
+#3  videoHDR off (explicit). `automaticallyAdjustsVideoHDREnabled = false` FIRST (else the
+    system may re-enable HDR), then `isVideoHDREnabled = false` — but ONLY if
+    `activeFormat.isVideoHDRSupported`. Lock block. Largely redundant with #1 (which already
+    disabled it), which is why it read as ~neutral.
+
+#4  Global tone mapping on. `isGlobalToneMappingEnabled = true`, guarded by
+    `activeFormat.isGlobalToneMappingSupported`. HARD PRECONDITION: GTM and videoHDR are
+    MUTUALLY EXCLUSIVE — setting GTM true THROWS if videoHDR is enabled. So you must set
+    `automaticallyAdjustsVideoHDREnabled = false` first (that one line of #3 is mandatory
+    here). Lock block.
+
+#5  Low-light boost off. `automaticallyEnablesLowLightBoostWhenAvailable = false`, guarded
+    by `isLowLightBoostSupported`. Lock block. Only has any effect when the scene is dark
+    enough for iOS to engage the boost — on a lit screen it likely never engages, so this
+    is effectively a no-op (its "worse" number was probably thermal/noise).
+
+#6  Geometric distortion correction off. `isGeometricDistortionCorrectionEnabled = false`,
+    guarded by `isGeometricDistortionCorrectionSupported`. Lock block. Stops the per-frame
+    barrel-undistort resample; straight screen edges then bow slightly near frame margins
+    (refine_quad's line fits absorb it).
+
+#7  Video stabilization off. THIS ONE IS NOT ON THE DEVICE. It is a property of the
+    AVCaptureConnection: `output.connection(with: .video)?.preferredVideoStabilizationMode
+    = .off`, guarded by `connection.isVideoStabilizationSupported`. Set it OUTSIDE the
+    device lock block (connection config, not device config). Easy to miss because every
+    other switch here is a device property.
+
+#8  Short shutter. Replaces the plain `exposureMode = .locked` with
+    `setExposureModeCustom(duration:iso:completionHandler:)`. duration = min(current, 1/125)
+    ~= 8 ms; ISO must be scaled UP by (oldDuration/newDuration) to preserve brightness AND
+    clamped to `activeFormat.minISO ... maxISO`. Lock block, in settleAndLock AFTER the
+    autofocus has converged (so we read the auto-picked exposure as the baseline to shorten
+    from). Pairs with #2 (only worth the noise cost when 60 fps capture + high display fps
+    make blend the dominant error). The tripled ISO (~90->~280) raises sensor noise, which
+    used to fragment the geometry ring-blob — now absorbed by the despeckle + bezel-reject
+    fixes in Geometry.swift, so #8 no longer breaks the locate step.
+
+Bottom line for the next reader: adopt #1+#2, skip #3-#7, keep #8 only for the high-fps
+future — and go fix the decode-worker throughput (ANE path), because THAT is what caps
+the transfer, not the camera.
+
+## Combination runs (after the solo bisection; factory model each)
+
+| config       | result                                                              |
+|--------------|---------------------------------------------------------------------|
+| #1+#2        | 0.2-0.3% err, 31 KB/s byte-perfect                                  |
+| #1+#2+#5+#6  | **35 KB/s BYTE-PERFECT, 6 dropped / 6 rebuilt — the reliable record**|
+| #1+#2+#5+#6+#8 | 0.6% err, 17 dropped, FAILED                                      |
+
+Combination lessons:
+- #5+#6 together on the clean base are FINE (0.2-0.4%) — #5's solo "~0.7%" verdict was
+  noise/thermal after all (low-light boost never engages on a lit screen). The solo
+  rejections of small-effect settings were at the edge of run-to-run variance; only the
+  clear losers (#4 GTM, #7 EIS-off) stay confidently rejected.
+- #8 (short shutter, ISO ~90 -> ~280) IS a real cost when stacked: err tripled to 0.6%
+  and drops rose past the repair budget. Its ISO noise hurts both the NN and the decode
+  rate at today's display fps, where the 25 ms auto shutter blends little. Keep #8 OFF
+  until display fps > ~20 makes blend the dominant error — then re-test.
+- PRODUCTION CONFIG (2026-07-17 final): #1+#2+#5+#6. Info line in the app log:
+  "camera: PRODUCTION #1+#2+#5+#6 (1080p60 + lowlight off + geoDC off)".
